@@ -2118,20 +2118,30 @@ impl BaseProofsInitialStateStore for RocksdbProofsStorage {
         hashed_address: B256,
         storage_nodes: Vec<(Nibbles, Option<BranchNodeCompact>)>,
     ) -> BaseProofsStorageResult<()> {
-        let mut storage_nodes = storage_nodes;
-        if storage_nodes.is_empty() {
+        self.store_storage_branches_bulk(vec![(hashed_address, storage_nodes)])
+    }
+
+    fn store_storage_branches_bulk(
+        &self,
+        entries: Vec<(B256, Vec<(Nibbles, Option<BranchNodeCompact>)>)>,
+    ) -> BaseProofsStorageResult<()> {
+        if entries.is_empty() {
             return Ok(());
         }
-
-        storage_nodes.sort_by_key(|(key, _)| *key);
         let _guard = self.history_gate.write();
         let mut batch = WriteBatch::default();
-        self.persist_history_batch::<StorageTrieHistory, _, _>(
-            &mut batch,
-            0,
-            storage_nodes.into_iter().map(|(path, node)| (hashed_address, path, node)),
-            true,
-        )?;
+        for (hashed_address, mut storage_nodes) in entries {
+            if storage_nodes.is_empty() {
+                continue;
+            }
+            storage_nodes.sort_by_key(|(key, _)| *key);
+            self.persist_history_batch::<StorageTrieHistory, _, _>(
+                &mut batch,
+                0,
+                storage_nodes.into_iter().map(|(path, node)| (hashed_address, path, node)),
+                true,
+            )?;
+        }
         self.db.write_opt(batch, &self.write_options).map_err(rocksdb_error)?;
         Ok(())
     }
@@ -2163,22 +2173,32 @@ impl BaseProofsInitialStateStore for RocksdbProofsStorage {
         hashed_address: B256,
         storages: Vec<(B256, U256)>,
     ) -> BaseProofsStorageResult<()> {
-        let mut storages = storages;
-        if storages.is_empty() {
+        self.store_hashed_storages_bulk(vec![(hashed_address, storages)])
+    }
+
+    fn store_hashed_storages_bulk(
+        &self,
+        entries: Vec<(B256, Vec<(B256, U256)>)>,
+    ) -> BaseProofsStorageResult<()> {
+        if entries.is_empty() {
             return Ok(());
         }
-
-        storages.sort_by_key(|(key, _)| *key);
         let _guard = self.history_gate.write();
         let mut batch = WriteBatch::default();
-        self.persist_history_batch::<HashedStorageHistory, _, _>(
-            &mut batch,
-            0,
-            storages
-                .into_iter()
-                .map(|(key, value)| (hashed_address, key, Some(StorageValue(value)))),
-            true,
-        )?;
+        for (hashed_address, mut storages) in entries {
+            if storages.is_empty() {
+                continue;
+            }
+            storages.sort_by_key(|(key, _)| *key);
+            self.persist_history_batch::<HashedStorageHistory, _, _>(
+                &mut batch,
+                0,
+                storages
+                    .into_iter()
+                    .map(|(key, value)| (hashed_address, key, Some(StorageValue(value)))),
+                true,
+            )?;
+        }
         self.db.write_opt(batch, &self.write_options).map_err(rocksdb_error)?;
         Ok(())
     }
