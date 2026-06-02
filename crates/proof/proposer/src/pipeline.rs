@@ -32,7 +32,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     panic::AssertUnwindSafe,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use alloy_primitives::{Address, B256, Signature, keccak256};
@@ -112,8 +111,6 @@ struct PipelineState {
     proved: BTreeMap<u64, ProofResult>,
     /// Target blocks currently being proved.
     inflight: BTreeSet<u64>,
-    /// Prover-service proof sessions currently being proved.
-    pending_proofs: BTreeMap<u64, PendingProofSession>,
     /// Target block currently being submitted (at most one).
     submitting: Option<u64>,
     /// Per-target-block retry counts; exceeding `max_retries` triggers a full reset.
@@ -128,29 +125,9 @@ struct ProofPlan {
     target_block: u64,
 }
 
-#[derive(Debug, Clone)]
-struct PendingProofSession {
-    plan: ProofPlan,
-    session_id: String,
-    request: ProofRequest,
-    retry_count: u32,
-    started_at: Instant,
-}
-
 enum ProofDispatchOutcome {
-    Accepted(PendingProofSession),
-    Failed { session: PendingProofSession, error: ProposerError },
-}
-
-impl PendingProofSession {
-    fn new(plan: ProofPlan, request: ProofRequest, retry_count: u32) -> Self {
-        let session_id = ProposerProofAdapter::tee_session_id(&request, TeeKind::AwsNitro);
-        Self { plan, session_id, request, retry_count, started_at: Instant::now() }
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
-    }
+    Accepted { plan: ProofPlan, session_id: String },
+    Failed { plan: ProofPlan, error: ProposerError },
 }
 
 impl PipelineState {
@@ -161,7 +138,6 @@ impl PipelineState {
             submit_tasks: JoinSet::new(),
             proved: BTreeMap::new(),
             inflight: BTreeSet::new(),
-            pending_proofs: BTreeMap::new(),
             submitting: None,
             retry_counts: BTreeMap::new(),
             cached_recovery: None,
@@ -177,7 +153,6 @@ impl PipelineState {
     fn prune_stale(&mut self, recovered_block: u64) {
         self.proved.retain(|&target, _| target > recovered_block);
         self.inflight.retain(|&target| target > recovered_block);
-        self.pending_proofs.retain(|&target, _| target > recovered_block);
         self.retry_counts.retain(|&target, _| target > recovered_block);
         // NOTE: we intentionally do NOT abort in-flight submit tasks here.
         // When the recovered block advances past the submitting block, it
@@ -366,7 +341,7 @@ where
             Metrics::safe_head().set(safe_head as f64);
             Metrics::last_proposed_block().set(recovered.l2_block_number as f64);
             state.prune_stale(recovered.l2_block_number);
-            self.collect_proofs(state).await;
+            self.collect_proofs(&recovered, safe_head, state).await;
             self.dispatch_proofs(&recovered, safe_head, state).await?;
         }
         Ok(())
@@ -403,8 +378,7 @@ where
 
         for (plan, request) in requests {
             let retry_count = state.retry_counts.get(&plan.target_block).copied().unwrap_or(0);
-            let session = PendingProofSession::new(plan, request, retry_count);
-            let session_id = session.session_id.clone();
+            let session_id = ProposerProofAdapter::tee_session_id(&request, TeeKind::AwsNitro);
             let dispatcher = self.proof_dispatcher.clone();
             let cancel = self.cancel.child_token();
 
@@ -418,29 +392,28 @@ where
             );
             state.inflight.insert(plan.target_block);
             state.dispatch_tasks.spawn(async move {
-                let session_for_panic = session.clone();
                 let inner = async move {
                     tokio::select! {
                         () = cancel.cancelled() => {
                             ProofDispatchOutcome::Failed {
-                                session,
+                                plan,
                                 error: ProposerError::Internal("cancelled".into()),
                             }
                         }
-                        result = dispatcher.dispatch_tee(session.request.clone()) => {
+                        result = dispatcher.dispatch_tee(request) => {
                             match result {
-                                Ok(dispatched) if dispatched.session_id == session.session_id => {
-                                    ProofDispatchOutcome::Accepted(session)
+                                Ok(dispatched) if dispatched.session_id == session_id => {
+                                    ProofDispatchOutcome::Accepted { plan, session_id }
                                 }
                                 Ok(dispatched) => ProofDispatchOutcome::Failed {
-                                    session,
+                                    plan,
                                     error: ProposerError::Prover(format!(
                                         "prover service returned mismatched session_id: expected {}, got {}",
                                         session_id,
                                         dispatched.session_id
                                     )),
                                 },
-                                Err(error) => ProofDispatchOutcome::Failed { session, error },
+                                Err(error) => ProofDispatchOutcome::Failed { plan, error },
                             }
                         }
                     }
@@ -451,10 +424,10 @@ where
                 match AssertUnwindSafe(inner).catch_unwind().await {
                     Ok(outcome) => outcome,
                     Err(panic) => ProofDispatchOutcome::Failed {
-                        session: session_for_panic,
+                        plan,
                         error: ProposerError::Internal(format!(
                             "proof dispatch task panicked: {}",
-                            panic_message(&panic)
+                            panic_message(&panic),
                         )),
                     },
                 }
@@ -546,44 +519,46 @@ where
         };
 
         match outcome {
-            ProofDispatchOutcome::Accepted(session) => {
-                let target = session.plan.target_block;
+            ProofDispatchOutcome::Accepted { plan, session_id } => {
                 info!(
-                    target_block = target,
-                    session_id = %session.session_id,
-                    from_block = session.plan.start_block,
-                    retry_count = session.retry_count,
+                    target_block = plan.target_block,
+                    session_id = %session_id,
+                    from_block = plan.start_block,
                     "Proof request accepted by prover service"
                 );
-                state.pending_proofs.insert(target, session);
                 state.record_gauges();
             }
-            ProofDispatchOutcome::Failed { session, error } => {
-                let target = session.plan.target_block;
-                self.handle_proof_failure(target, error, state, Some(session));
+            ProofDispatchOutcome::Failed { plan, error } => {
+                self.handle_proof_failure(plan.target_block, error, state);
             }
         }
     }
 
-    async fn collect_proofs(&self, state: &mut PipelineState) {
-        let targets = state.pending_proofs.keys().copied().collect::<Vec<_>>();
+    async fn collect_proofs(
+        &self,
+        recovered: &RecoveredState,
+        safe_head: u64,
+        state: &mut PipelineState,
+    ) {
+        let targets = self.collectable_targets(recovered, safe_head, state);
+        let roots = self.fetch_canonical_root_results_with(targets.clone(), false).await;
 
         for target in targets {
-            let Some(session) = state.pending_proofs.get(&target).cloned() else {
-                continue;
-            };
+            let Some(Ok(root)) = roots.get(&target) else { continue };
+            let session_id =
+                ProposerProofAdapter::tee_session_id_for_root(*root, TeeKind::AwsNitro);
 
             let response = match self
                 .proof_requester
-                .get_proof(GetProofRequest { session_id: session.session_id.clone() })
+                .get_proof(GetProofRequest { session_id: session_id.clone() })
                 .await
             {
                 Ok(response) => response,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         error = %e,
                         target_block = target,
-                        session_id = %session.session_id,
+                        session_id = %session_id,
                         "Failed to poll proof status"
                     );
                     continue;
@@ -594,25 +569,16 @@ where
                 ProofStatus::Queued | ProofStatus::Running => {
                     debug!(
                         target_block = target,
-                        session_id = %session.session_id,
+                        session_id = %session_id,
                         status = ?response.status,
-                        elapsed = ?session.elapsed(),
                         "Proof request still pending"
                     );
                 }
                 ProofStatus::Failed => {
                     let message = response.error_message.unwrap_or_else(|| {
-                        format!(
-                            "proof session {} failed without an error message",
-                            session.session_id
-                        )
+                        format!("proof session {session_id} failed without an error message")
                     });
-                    self.handle_proof_failure(
-                        target,
-                        ProposerError::Prover(message),
-                        state,
-                        Some(session),
-                    );
+                    self.handle_proof_failure(target, ProposerError::Prover(message), state);
                 }
                 ProofStatus::Succeeded => {
                     let result = match response.result {
@@ -621,11 +587,9 @@ where
                             self.handle_proof_failure(
                                 target,
                                 ProposerError::Prover(format!(
-                                    "proof session {} succeeded without a result",
-                                    session.session_id
+                                    "proof session {session_id} succeeded without a result"
                                 )),
                                 state,
-                                Some(session),
                             );
                             continue;
                         }
@@ -634,21 +598,17 @@ where
                     match ProposerProofAdapter::tee_proof_result(result, TeeKind::AwsNitro) {
                         Ok(proof_result) => {
                             state.inflight.remove(&target);
-                            state.pending_proofs.remove(&target);
                             state.retry_counts.remove(&target);
                             state.proved.insert(target, proof_result);
                             state.record_gauges();
                             info!(
                                 target_block = target,
-                                session_id = %session.session_id,
-                                from_block = session.plan.start_block,
-                                retry_count = session.retry_count,
-                                elapsed = ?session.elapsed(),
+                                session_id = %session_id,
                                 "Proof completed successfully"
                             );
                         }
                         Err(error) => {
-                            self.handle_proof_failure(target, error, state, Some(session));
+                            self.handle_proof_failure(target, error, state);
                         }
                     }
                 }
@@ -656,25 +616,40 @@ where
         }
     }
 
-    fn handle_proof_failure(
+    fn collectable_targets(
         &self,
-        target: u64,
-        error: ProposerError,
-        state: &mut PipelineState,
-        session: Option<PendingProofSession>,
-    ) {
+        recovered: &RecoveredState,
+        safe_head: u64,
+        state: &PipelineState,
+    ) -> Vec<u64> {
+        let mut cursor =
+            match recovered.l2_block_number.checked_add(self.config.driver.block_interval) {
+                Some(cursor) => cursor,
+                None => return Vec::new(),
+            };
+        let mut targets = Vec::new();
+
+        while cursor <= safe_head {
+            if !state.proved.contains_key(&cursor) && state.submitting != Some(cursor) {
+                targets.push(cursor);
+            }
+            cursor = match cursor.checked_add(self.config.driver.block_interval) {
+                Some(cursor) => cursor,
+                None => break,
+            };
+        }
+
+        targets
+    }
+
+    fn handle_proof_failure(&self, target: u64, error: ProposerError, state: &mut PipelineState) {
         Metrics::errors_total(error.metric_label()).increment(1);
         state.inflight.remove(&target);
-        state.pending_proofs.remove(&target);
         let count = state.retry_counts.entry(target).or_insert(0);
         *count += 1;
         if *count >= self.config.max_retries {
             error!(
                 target_block = target,
-                session_id = ?session.as_ref().map(|s| s.session_id.as_str()),
-                from_block = ?session.as_ref().map(|s| s.plan.start_block),
-                session_retry_count = ?session.as_ref().map(|s| s.retry_count),
-                elapsed = ?session.as_ref().map(PendingProofSession::elapsed),
                 attempts = *count,
                 error = %error,
                 "Proof failed after max retries, dropping cached recovery"
@@ -684,10 +659,6 @@ where
         } else {
             warn!(
                 target_block = target,
-                session_id = ?session.as_ref().map(|s| s.session_id.as_str()),
-                from_block = ?session.as_ref().map(|s| s.plan.start_block),
-                session_retry_count = ?session.as_ref().map(|s| s.retry_count),
-                elapsed = ?session.as_ref().map(PendingProofSession::elapsed),
                 attempt = *count,
                 error = %error,
                 "Proof failed, will retry next tick"
