@@ -520,6 +520,17 @@ where
 
         match outcome {
             ProofDispatchOutcome::Accepted { plan, session_id } => {
+                if !state.inflight.contains(&plan.target_block)
+                    || state.proved.contains_key(&plan.target_block)
+                {
+                    debug!(
+                        target_block = plan.target_block,
+                        session_id = %session_id,
+                        "Ignoring stale proof dispatch result"
+                    );
+                    return;
+                }
+
                 info!(
                     target_block = plan.target_block,
                     session_id = %session_id,
@@ -529,6 +540,17 @@ where
                 state.record_gauges();
             }
             ProofDispatchOutcome::Failed { plan, error } => {
+                if !state.inflight.contains(&plan.target_block)
+                    || state.proved.contains_key(&plan.target_block)
+                {
+                    debug!(
+                        target_block = plan.target_block,
+                        error = %error,
+                        "Ignoring stale proof dispatch failure"
+                    );
+                    return;
+                }
+
                 self.handle_proof_failure(plan.target_block, error, state);
             }
         }
