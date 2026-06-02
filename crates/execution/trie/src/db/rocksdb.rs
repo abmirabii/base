@@ -3022,6 +3022,13 @@ fn prefix_read_options(prefix: &[u8]) -> ReadOptions {
     if let Some(upper_bound) = prefix_upper_bound(prefix) {
         read_options.set_iterate_upper_bound(upper_bound);
     }
+    // CF prefix extractor is the full KEY_LEN (e.g. 65 bytes for StorageTrieHistory =
+    // 32B hashed_address + 33B packed nibbles). Callers seek with a shorter prefix
+    // (e.g. 32B hashed_address only). Without total_order_seek, the prefix bloom
+    // filter compares full-length extracted prefixes and silently skips SST blocks
+    // after a flush, dropping all entries except those still in the memtable. The
+    // explicit iterate_lower_bound / iterate_upper_bound above still scope the scan.
+    read_options.set_total_order_seek(true);
     read_options
 }
 
