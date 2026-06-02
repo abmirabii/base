@@ -32,7 +32,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     panic::AssertUnwindSafe,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use alloy_primitives::{Address, B256, Signature, keccak256};
@@ -43,7 +42,6 @@ use base_proof_contracts::{
 };
 use base_proof_primitives::{ProofJournal, ProofRequest, ProofResult, ProverClient};
 use base_proof_rpc::{L1Provider, L2Provider, RollupProvider, RpcError};
-use base_prover_service_protocol::TeeKind;
 use eyre::Result;
 use futures::{FutureExt, StreamExt, stream};
 use tokio::task::JoinSet;
@@ -55,7 +53,6 @@ use crate::{
     driver::{DriverConfig, RecoveredState},
     error::ProposerError,
     output_proposer::OutputProposer,
-    proof_adapter::ProposerProofAdapter,
 };
 
 /// Configuration for the parallel proving pipeline.
@@ -109,8 +106,6 @@ struct PipelineState {
     proved: BTreeMap<u64, ProofResult>,
     /// Target blocks currently being proved.
     inflight: BTreeSet<u64>,
-    /// Prover-service proof sessions currently being proved.
-    pending_proofs: BTreeMap<u64, PendingProofSession>,
     /// Target block currently being submitted (at most one).
     submitting: Option<u64>,
     /// Per-target-block retry counts; exceeding `max_retries` triggers a full reset.
@@ -125,26 +120,6 @@ struct ProofPlan {
     target_block: u64,
 }
 
-#[derive(Debug, Clone)]
-struct PendingProofSession {
-    plan: ProofPlan,
-    session_id: String,
-    request: ProofRequest,
-    retry_count: u32,
-    started_at: Instant,
-}
-
-impl PendingProofSession {
-    fn new(plan: ProofPlan, request: ProofRequest, retry_count: u32) -> Self {
-        let session_id = ProposerProofAdapter::tee_session_id(&request, TeeKind::AwsNitro);
-        Self { plan, session_id, request, retry_count, started_at: Instant::now() }
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
-    }
-}
-
 impl PipelineState {
     fn new() -> Self {
         Self {
@@ -152,7 +127,6 @@ impl PipelineState {
             submit_tasks: JoinSet::new(),
             proved: BTreeMap::new(),
             inflight: BTreeSet::new(),
-            pending_proofs: BTreeMap::new(),
             submitting: None,
             retry_counts: BTreeMap::new(),
             cached_recovery: None,
@@ -168,7 +142,6 @@ impl PipelineState {
     fn prune_stale(&mut self, recovered_block: u64) {
         self.proved.retain(|&target, _| target > recovered_block);
         self.inflight.retain(|&target| target > recovered_block);
-        self.pending_proofs.retain(|&target, _| target > recovered_block);
         self.retry_counts.retain(|&target, _| target > recovered_block);
         // NOTE: we intentionally do NOT abort in-flight submit tasks here.
         // When the recovered block advances past the submitting block, it
@@ -343,6 +316,7 @@ where
             self.try_recover_and_plan(&mut state.cached_recovery).await
         {
             Metrics::safe_head().set(safe_head as f64);
+            Metrics::last_proposed_block().set(recovered.l2_block_number as f64);
             state.prune_stale(recovered.l2_block_number);
             self.dispatch_proofs(&recovered, safe_head, state).await?;
         }
@@ -379,23 +353,16 @@ where
         };
 
         for (plan, request) in requests {
-            let retry_count = state.retry_counts.get(&plan.target_block).copied().unwrap_or(0);
-            let session = PendingProofSession::new(plan, request, retry_count);
-            let request = session.request.clone();
-            let session_id = session.session_id.clone();
             let prover = Arc::clone(&self.prover);
             let cancel = self.cancel.child_token();
 
             info!(
-                session_id = %session_id,
                 from_block = plan.start_block,
                 to_block = plan.target_block,
                 blocks = plan.target_block.saturating_sub(plan.start_block),
-                retry_count,
                 "Dispatching proof task"
             );
             state.inflight.insert(plan.target_block);
-            state.pending_proofs.insert(plan.target_block, session);
             state.prove_tasks.spawn(async move {
                 let target = plan.target_block;
                 let inner = async move {
@@ -705,32 +672,19 @@ where
         match join_result {
             Ok((target, Ok(proof_result))) => {
                 state.inflight.remove(&target);
-                let session = state.pending_proofs.remove(&target);
                 state.retry_counts.remove(&target);
                 state.proved.insert(target, proof_result);
                 state.record_gauges();
-                info!(
-                    target_block = target,
-                    session_id = ?session.as_ref().map(|s| s.session_id.as_str()),
-                    from_block = ?session.as_ref().map(|s| s.plan.start_block),
-                    retry_count = ?session.as_ref().map(|s| s.retry_count),
-                    elapsed = ?session.as_ref().map(PendingProofSession::elapsed),
-                    "Proof completed successfully"
-                );
+                info!(target_block = target, "Proof completed successfully");
             }
             Ok((target, Err(e))) => {
                 Metrics::errors_total(e.metric_label()).increment(1);
                 state.inflight.remove(&target);
-                let session = state.pending_proofs.remove(&target);
                 let count = state.retry_counts.entry(target).or_insert(0);
                 *count += 1;
                 if *count >= self.config.max_retries {
                     error!(
                         target_block = target,
-                        session_id = ?session.as_ref().map(|s| s.session_id.as_str()),
-                        from_block = ?session.as_ref().map(|s| s.plan.start_block),
-                        session_retry_count = ?session.as_ref().map(|s| s.retry_count),
-                        elapsed = ?session.as_ref().map(PendingProofSession::elapsed),
                         attempts = *count,
                         error = %e,
                         "Proof failed after max retries, dropping cached recovery"
@@ -747,10 +701,6 @@ where
                 } else {
                     warn!(
                         target_block = target,
-                        session_id = ?session.as_ref().map(|s| s.session_id.as_str()),
-                        from_block = ?session.as_ref().map(|s| s.plan.start_block),
-                        session_retry_count = ?session.as_ref().map(|s| s.retry_count),
-                        elapsed = ?session.as_ref().map(PendingProofSession::elapsed),
                         attempt = *count,
                         error = %e,
                         "Proof failed, will retry next tick"
@@ -1630,6 +1580,11 @@ mod tests {
     use alloy_primitives::{Address, B256};
     use async_trait::async_trait;
     use base_proof_primitives::{ProofResult, Proposal, ProverClient};
+    #[cfg(feature = "metrics")]
+    use metrics_util::{
+        CompositeKey, MetricKind,
+        debugging::{DebugValue, DebuggingRecorder, Snapshotter},
+    };
     use rstest::rstest;
     use tokio_util::sync::CancellationToken;
 
@@ -1641,6 +1596,28 @@ mod tests {
     };
 
     // ---- Named constants for test data ----
+
+    #[cfg(feature = "metrics")]
+    type SnapEntry =
+        (CompositeKey, Option<metrics::Unit>, Option<metrics::SharedString>, DebugValue);
+
+    #[cfg(feature = "metrics")]
+    fn with_recorder(f: impl FnOnce(Snapshotter)) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || f(snapshotter));
+    }
+
+    #[cfg(feature = "metrics")]
+    fn find_metric<'a>(
+        snap: &'a [SnapEntry],
+        kind: MetricKind,
+        name: &str,
+    ) -> Option<&'a DebugValue> {
+        snap.iter()
+            .find(|(ck, _, _, _)| ck.kind() == kind && ck.key().name() == name)
+            .map(|(_, _, _, v)| v)
+    }
 
     /// Game type used across recovery tests.
     const TEST_GAME_TYPE: u32 = 42;
@@ -1965,6 +1942,30 @@ mod tests {
 
         let result = handle.await.expect("task should not panic");
         assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_tick_records_recovered_last_proposed_block() {
+        let (factory, output_roots) = game_chain(1);
+        let pipeline = recovery_pipeline(factory, output_roots);
+
+        with_recorder(|snap| {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let mut state = PipelineState::new();
+
+            rt.block_on(async {
+                pipeline.tick(&mut state).await.unwrap();
+            });
+
+            let snapshot = snap.snapshot().into_vec();
+            match find_metric(&snapshot, MetricKind::Gauge, "base_proposer.last_proposed_block") {
+                Some(DebugValue::Gauge(value)) => {
+                    assert_eq!(value.into_inner(), TEST_BLOCK_INTERVAL as f64);
+                }
+                other => panic!("expected recovered last_proposed_block gauge, got {other:?}"),
+            }
+        });
     }
 
     // ---- Recovery: empty factory ----
