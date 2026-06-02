@@ -629,7 +629,7 @@ where
             };
         let mut targets = Vec::new();
 
-        while cursor <= safe_head {
+        while cursor <= safe_head && targets.len() < self.config.max_parallel_proofs {
             if !state.proved.contains_key(&cursor) && state.submitting != Some(cursor) {
                 targets.push(cursor);
             }
