@@ -27,6 +27,7 @@ etc/docker/
 # Devnet tooling not needed in container builds
 etc/scripts/devnet/grafana/
 etc/scripts/devnet/load/
+hi
 etc/scripts/devnet/prometheus.yml
 etc/scripts/devnet/status.sh
 etc/scripts/devnet/accounts.sh
