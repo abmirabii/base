@@ -141,11 +141,9 @@ where
                 match e {
                     StateProcessorError::Provider(ProviderError::MissingCanonicalHeader {
                         ..
-                    }) => {
-                        if self.cache.lock().await.insert(flashblock) {
-                            debug!(message = "cached flashblock pending canonical block", error = %e);
-                            return;
-                        }
+                    }) if self.cache.lock().await.insert(flashblock.clone()) => {
+                        debug!(message = "cached flashblock pending canonical block", error = %e);
+                        return;
                     }
                     StateProcessorError::MissingFirstFlashblock => {
                         let mut cache = self.cache.lock().await;

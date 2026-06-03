@@ -588,11 +588,11 @@ impl View for UpgradesView {
                     self.checks.reset();
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                if self.selected_chain < self.chains.len() - 1 {
-                    self.selected_chain += 1;
-                    self.checks.reset();
-                }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab
+                if self.selected_chain < self.chains.len() - 1 =>
+            {
+                self.selected_chain += 1;
+                self.checks.reset();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.move_selected_check_hardfork(-1);

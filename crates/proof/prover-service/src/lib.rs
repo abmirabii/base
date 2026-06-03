@@ -1,4 +1,5 @@
 #![doc = include_str!("../README.md")]
+#![recursion_limit = "256"]
 
 mod backends;
 pub use backends::{

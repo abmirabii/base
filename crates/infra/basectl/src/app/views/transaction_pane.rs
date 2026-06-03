@@ -180,16 +180,12 @@ impl TransactionPane {
                 }
             }
 
-            KeyCode::Home | KeyCode::Char('g') => {
-                if len > 0 {
-                    self.table_state.select(Some(0));
-                }
+            KeyCode::Home | KeyCode::Char('g') if len > 0 => {
+                self.table_state.select(Some(0));
             }
 
-            KeyCode::End | KeyCode::Char('G') => {
-                if len > 0 {
-                    self.table_state.select(Some(len - 1));
-                }
+            KeyCode::End | KeyCode::Char('G') if len > 0 => {
+                self.table_state.select(Some(len - 1));
             }
 
             KeyCode::PageUp => {

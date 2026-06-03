@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{cmp::Reverse, collections::HashMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ impl<'a> MetricsAggregator<'a> {
     ) -> MetricsSummary {
         let mut top_failure_reasons: Vec<(String, u64)> =
             failure_reasons.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        top_failure_reasons.sort_by(|a, b| b.1.cmp(&a.1));
+        top_failure_reasons.sort_by_key(|failure_reason| Reverse(failure_reason.1));
         top_failure_reasons.truncate(3);
 
         let tps_values: Vec<f64> = throughput_samples.iter().map(|s| s.tps).collect();
